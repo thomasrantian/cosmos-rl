@@ -946,6 +946,14 @@ class PolicyStatusManager:
             if self.config.mode == "colocated":
                 # In colocated mode, we initially trigger data fetch for step 1 since the rollouts are generated locally.
                 self.current_step += 1
+                # Keep the first colocated command symmetric with the generic
+                # dispatch path below.  Its eventual train_ack settles the
+                # exact number of rollouts recorded under this step; without
+                # this entry resumed jobs warn about a missing dispatch and
+                # leave samples_on_the_fly accounting stale.
+                self.dispatched_rollouts_by_step[self.current_step] = (
+                    self.config.train.train_batch_per_replica * len(valid_replicas)
+                )
                 if self.config.validation.enable and (
                     self.current_step % self.config.validation.freq == 0
                     or self.current_step == self.total_steps
