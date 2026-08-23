@@ -112,6 +112,47 @@ def test_discard_settlement_requires_report_id():
     assert manager.filter_records == {}
 
 
+def test_initial_colocated_data_fetch_records_dispatched_rollouts():
+    manager = PolicyStatusManager()
+    replica = SimpleNamespace(
+        name="policy-0",
+        start_time=0,
+        weights_loaded_in_view_of_command=True,
+    )
+    manager.config = SimpleNamespace(
+        mode="colocated",
+        policy=SimpleNamespace(
+            parallelism=SimpleNamespace(n_init_replicas=1),
+        ),
+        train=SimpleNamespace(train_batch_per_replica=4),
+        validation=SimpleNamespace(enable=False),
+    )
+    manager.redis_handler = MagicMock()
+    manager.data_fetcher = SimpleNamespace(
+        validation_activate_dataloader=MagicMock(),
+    )
+    manager.current_step = 1
+    manager.total_steps = 5
+    manager.remain_samples_num = 196
+    manager.trigger_rebuild_mesh = MagicMock()
+    manager.set_status = MagicMock()
+
+    with patch(
+        "cosmos_rl.dispatcher.status.command.DataFetchCommand.trigger"
+    ) as trigger:
+        manager.post_register_hook(
+            valid_replicas=[replica],
+            target_replica=replica,
+            config=manager.config,
+            rollout_status_manager=MagicMock(),
+        )
+
+    assert manager.current_step == 2
+    assert manager.dispatched_rollouts_by_step == {2: 4}
+    assert manager.remain_samples_num == 192
+    trigger.assert_called_once()
+
+
 def test_http_discard_report_settles_before_normal_admission():
     from cosmos_rl.dispatcher import run_web_panel
 
