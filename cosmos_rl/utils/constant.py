@@ -37,6 +37,17 @@ COSMOS_HEARTBEAT_SEND_INTERVAL = int(
 # teardown -- which strands the clean unregister.
 COSMOS_CONTROL_HTTP_TIMEOUT = float(os.environ.get("COSMOS_CONTROL_HTTP_TIMEOUT", "30"))
 
+# Worker shutdown is best-effort and must never inherit the deep control-plane
+# retry budget. A controller may deliberately exit as soon as the last replica
+# is removed, racing the unregister response. Keep this path short so worker
+# processes cannot strand a completed scheduler allocation for tens of minutes.
+COSMOS_SHUTDOWN_HTTP_TIMEOUT = float(
+    os.environ.get("COSMOS_SHUTDOWN_HTTP_TIMEOUT", "2")
+)
+COSMOS_SHUTDOWN_HTTP_MAX_ATTEMPTS = int(
+    os.environ.get("COSMOS_SHUTDOWN_HTTP_MAX_ATTEMPTS", "1")
+)
+
 COSMOS_ROLLOUT_SCAN_INTERVAL = int(os.environ.get("COSMOS_ROLLOUT_SCAN_INTERVAL", "10"))
 # Opt-in escalation: when truthy, the controller's replica-status monitor
 # initiates a controller-wide shutdown (SIGTERM to self -> FastAPI lifespan

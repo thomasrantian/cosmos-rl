@@ -179,21 +179,25 @@ class APIClient(object):
         # which then deadlocks worker teardown -- the worker process
         # never reaches ``destroy_distributed()`` and its UCXX server
         # threads keep polling until the orchestrator hard-kills the
-        # job.  Cap the per-attempt time; retries use ``self.max_retries``
-        # (``COSMOS_HTTP_RETRY_CONFIG``).  Best-effort cleanup, not a
-        # correctness requirement (the controller will GC the replica via
-        # heartbeat timeout if this fails).
+        # job.  Unregister is best-effort: once local teardown has finished,
+        # the controller will GC a missing replica through its heartbeat
+        # timeout.  Use a short shutdown-specific retry budget instead of the
+        # normal 60-attempt control-plane budget.  In particular, the last
+        # replica can race the controller's coordinated exit after its request
+        # was accepted but before the HTTP response reaches this process.
         try:
             make_request_with_retry(
                 partial(
                     requests.post,
                     json={"replica_name": replica_name},
-                    # Bounded so a hung socket during teardown cannot block the
-                    # clean unregister forever (which would strand the controller).
-                    timeout=constant.COSMOS_CONTROL_HTTP_TIMEOUT,
+                    timeout=constant.COSMOS_SHUTDOWN_HTTP_TIMEOUT,
                 ),
                 self.get_alternative_urls(COSMOS_API_UNREGISTER_SUFFIX),
-                max_retries=self.max_retries,
+                max_retries=constant.COSMOS_SHUTDOWN_HTTP_MAX_ATTEMPTS,
+                retries_per_delay=1,
+                initial_delay=0.0,
+                max_delay=0.0,
+                backoff_factor=1.0,
             )
         except Exception as e:
             logger.error(f"Failed to unregister from controller: {e}")
