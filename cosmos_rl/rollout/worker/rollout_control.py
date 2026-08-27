@@ -605,14 +605,16 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
     def handle_stop(self, command: StopCommand):
         """Controller-authoritative end-of-job stop (non-validation runs).
 
-        The controller publishes STOP once every policy replica has
-        unregistered (its main loop finished, so no policy will read this
-        rollout's output again).  Setting the shutdown signals here breaks
-        ``main_loop`` out of *any* branch -- normal drain, an empty queue,
-        or the weight-version-gate spin that no longer clears once weight
-        syncs have stopped (the residual hang the prompt-stream ``is_end``
-        could not reach).  No NCCL collective is involved, and teardown's
-        bounded ``cleanup_ucxx`` still lets any in-flight output read drain.
+        The controller normally publishes STOP after every policy recipient
+        has ACKed its terminal command and all rollouts have posted ``is_end``;
+        all policy replicas unregistering remains the crash/reap and legacy
+        fallback.  At either point no policy can start another training or
+        weight-sync round.  Setting the shutdown signals here breaks
+        ``main_loop`` out of *any* branch -- normal drain, an empty queue, or
+        the weight-version-gate spin that no longer clears once weight syncs
+        have stopped (the residual hang the prompt-stream ``is_end`` could not
+        reach).  No NCCL collective is involved, and teardown's bounded
+        ``cleanup_ucxx`` still lets any in-flight output read drain.
         """
         wst = getattr(self, "_weight_sync_thread", None)
         if wst is not None:

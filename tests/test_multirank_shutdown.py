@@ -181,11 +181,10 @@ class TestStopCommandHandler(unittest.TestCase):
 
 class TestShouldBroadcastStop(unittest.TestCase):
     """``should_broadcast_stop`` gates the controller's one-shot end-of-job
-    STOP broadcast.  It must fire exactly when the policy side is genuinely
-    done (all policy replicas gone *after* we saw some, training finished,
-    non-validation, not already sent) and stay silent for every other
-    transition -- notably cold start, transient scale-to-zero, and
-    validation runs."""
+    STOP broadcast.  It fires at the terminal ACK + rollout-end barrier even
+    while policies remain registered, or through the original all-policy-gone
+    fallback.  It stays silent for partial barriers, cold start, transient
+    scale-to-zero, validation, and repeat scans."""
 
     # The canonical "policy just finished" state -> the one case that fires.
     _FIRE = dict(
@@ -193,6 +192,7 @@ class TestShouldBroadcastStop(unittest.TestCase):
         had_policy_replicas=True,
         stop_broadcast_sent=False,
         validation_enabled=False,
+        terminal_complete=False,
         training_finished=True,
         all_rollouts_ended=False,
     )
@@ -201,8 +201,46 @@ class TestShouldBroadcastStop(unittest.TestCase):
         self.assertTrue(should_broadcast_stop(**self._FIRE))
 
     def test_silent_while_policy_still_present(self):
-        # n_policy > 0: policy still running -> never stop the rollouts.
+        # A registered policy without a completed terminal barrier can still
+        # train or weight-sync, so STOP remains unsafe.
         self.assertFalse(should_broadcast_stop(**{**self._FIRE, "n_policy": 2}))
+
+    def test_fires_at_terminal_barrier_while_policy_still_registered(self):
+        # All terminal recipients ACKed and all rollouts posted is_end.  Policy
+        # HTTP unregister may still be pending, but no new collective can
+        # start, so STOP must break the lifecycle cycle now.
+        self.assertTrue(
+            should_broadcast_stop(
+                **{
+                    **self._FIRE,
+                    "n_policy": 2,
+                    "terminal_complete": True,
+                    "all_rollouts_ended": True,
+                }
+            )
+        )
+
+    def test_terminal_barrier_requires_both_halves(self):
+        self.assertFalse(
+            should_broadcast_stop(
+                **{
+                    **self._FIRE,
+                    "n_policy": 2,
+                    "terminal_complete": True,
+                    "all_rollouts_ended": False,
+                }
+            )
+        )
+        self.assertFalse(
+            should_broadcast_stop(
+                **{
+                    **self._FIRE,
+                    "n_policy": 2,
+                    "terminal_complete": False,
+                    "all_rollouts_ended": True,
+                }
+            )
+        )
 
     def test_silent_on_cold_start(self):
         # n_policy == 0 but no policy ever seen -> startup, not end-of-job.
@@ -251,6 +289,17 @@ class TestShouldBroadcastStop(unittest.TestCase):
         # STOP would race that path.
         self.assertFalse(
             should_broadcast_stop(**{**self._FIRE, "validation_enabled": True})
+        )
+        self.assertFalse(
+            should_broadcast_stop(
+                **{
+                    **self._FIRE,
+                    "n_policy": 2,
+                    "terminal_complete": True,
+                    "all_rollouts_ended": True,
+                    "validation_enabled": True,
+                }
+            )
         )
 
     def test_one_shot_not_resent(self):
