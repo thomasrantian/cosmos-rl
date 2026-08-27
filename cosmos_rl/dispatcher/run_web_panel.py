@@ -261,21 +261,23 @@ async def lifespan(app: FastAPI):
             _maybe_finalize("heartbeat-death reap")
 
             # Authoritative end-of-job stop for the rollouts.  Tracked
-            # independently of the opt-in self-SIGTERM below.  A normal
-            # non-validation run ends with every policy replica
-            # unregistering immediately after its main loop completes, and a
-            # crashed policy is reaped by ``maintain_life_status``; either
-            # way ``n_policy == 0`` after we have seen policy replicas means
-            # no policy will read this run's rollout output again.  This is
-            # the correctly-ordered moment to stop rollouts: stopping on
-            # ``training_finished()`` instead would fire at dispatch time,
-            # before the policy has pulled the final outputs over UCXX.
+            # independently of the opt-in self-SIGTERM below.  The preferred
+            # path fires once every policy recipient has ACKed its terminal
+            # command *and* every rollout has posted ``is_end``.  At that
+            # barrier a still-registered policy can no longer initiate
+            # training or weight sync, so waiting for HTTP unregister would
+            # only create a lifecycle cycle.  The original all-policy-gone
+            # path remains as the crash/reap and legacy completion fallback.
+            # Stopping on ``training_finished()`` alone would still be too
+            # early: it can become true at dispatch time, before policy has
+            # pulled and ACKed the final command.
             n_policy = len(controller.policy_status_manager)
             if should_broadcast_stop(
                 n_policy=n_policy,
                 had_policy_replicas=_policy_replicas_were_registered,
                 stop_broadcast_sent=stop_broadcast_sent,
                 validation_enabled=controller.config.validation.enable,
+                terminal_complete=controller.policy_status_manager.terminal_complete,
                 training_finished=controller.policy_status_manager.training_finished(),
                 all_rollouts_ended=controller.rollout_status_manager.all_rollouts_ended(),
             ):
@@ -287,14 +289,11 @@ async def lifespan(app: FastAPI):
                 # final weight sync and shut down via the existing R2R
                 # ``replica_should_stop`` broadcast.
                 #
-                # The ``training_finished()`` guard distinguishes genuine
-                # end-of-job from a transient ``n_policy == 0`` during
-                # dynamic policy rescaling (scale-to-zero / rolling restart),
-                # where ``current_step < total_steps`` -- exactly the
-                # legitimate-transient case that keeps the SIGTERM escalation
-                # below opt-in.  ``training_finished()`` stays True once set
-                # (``recompute_total_steps`` early-returns), so it remains
-                # valid after the policy has unregistered.
+                # ``terminal_complete`` is set only after every terminal
+                # command recipient ACKs.  The fallback's
+                # ``training_finished()``/``all_rollouts_ended`` guard
+                # distinguishes genuine completion from a transient
+                # ``n_policy == 0`` during dynamic policy rescaling.
                 rollout_replicas = list(
                     controller.rollout_status_manager.rollout_replicas.values()
                 )
