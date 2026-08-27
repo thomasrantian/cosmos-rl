@@ -14,6 +14,7 @@ from cosmos_rl.dispatcher.status import (
     PolicyStatus,
     PolicyStatusManager,
     RolloutStatusManager,
+    should_broadcast_stop,
 )
 
 
@@ -452,6 +453,120 @@ class TestTerminalHttpAdmission(unittest.TestCase):
 
 
 class TestNaturalTerminalEvidence(unittest.TestCase):
+    def test_terminal_ack_and_rollout_end_release_stop_before_unregister(self):
+        """Exercise the production state objects, not just the pure predicate.
+
+        Policies intentionally remain registered throughout.  STOP becomes
+        eligible only after the last terminal-command ACK and the last rollout
+        end report have both landed.
+        """
+        manager = PolicyStatusManager()
+        manager.policy_replicas = {
+            name: SimpleNamespace(name=name) for name in ("p0", "p1")
+        }
+        manager.completion_step = 4
+        manager.completion_recipients = {"p0", "p1"}
+        manager.completion_acks = set()
+
+        rollout_manager = RolloutStatusManager()
+        rollout_manager.rollout_replicas = {
+            "r0": SimpleNamespace(status=SimpleNamespace(ended=True)),
+            "r1": SimpleNamespace(status=SimpleNamespace(ended=False)),
+        }
+
+        def should_stop():
+            return should_broadcast_stop(
+                n_policy=len(manager),
+                had_policy_replicas=True,
+                stop_broadcast_sent=False,
+                validation_enabled=False,
+                terminal_complete=manager.terminal_complete,
+                training_finished=manager.training_finished(),
+                all_rollouts_ended=rollout_manager.all_rollouts_ended(),
+            )
+
+        self.assertTrue(manager.record_completion_ack("p0", 4))
+        self.assertFalse(should_stop())
+        self.assertTrue(manager.record_completion_ack("p1", 4))
+        self.assertTrue(manager.terminal_complete)
+        self.assertFalse(should_stop())
+
+        rollout_manager.rollout_replicas["r1"].status.ended = True
+        self.assertTrue(rollout_manager.all_rollouts_ended())
+        self.assertEqual(len(manager), 2)
+        self.assertTrue(should_stop())
+
+    def test_real_final_datafetch_acks_release_stop_before_unregister(self):
+        """The natural final DataFetch path reaches the same STOP barrier.
+
+        The first policy ACK is insufficient.  The second ACK makes the real
+        final command fully reduced and sets ``terminal_complete``; STOP still
+        waits for the last rollout end report and then becomes eligible while
+        both policies remain registered.
+        """
+        manager = PolicyStatusManager()
+        manager.current_step = 2
+        manager.total_steps = 2
+        manager.samples_on_the_fly = 2
+        manager.remain_samples_num = 0
+        manager.dispatched_rollouts_by_step = {2: 2}
+        manager.rollout_buffer = Queue()
+        manager.rollout_buffer_per_rank = []
+        manager.policy_replicas = {
+            name: SimpleNamespace(name=name, all_atoms_arrived=True, start_time=index)
+            for index, name in enumerate(("p0", "p1"))
+        }
+        manager.status = {
+            name: PolicyStatus.RUNNING for name in manager.policy_replicas
+        }
+        manager.config = SimpleNamespace(
+            mode="disaggregated",
+            validation=SimpleNamespace(enable=False),
+            logging=SimpleNamespace(logger=[]),
+            train=SimpleNamespace(
+                train_policy=SimpleNamespace(
+                    type="grpo",
+                    on_policy=False,
+                    data_dispatch_as_rank_in_mesh=False,
+                )
+            ),
+        )
+        manager.should_weight_sync_after_train_ack = MagicMock(return_value=False)
+        manager.try_trigger_data_fetch_and_training = MagicMock()
+
+        rollout_manager = RolloutStatusManager()
+        rollout_manager.rollout_replicas = {
+            "r0": SimpleNamespace(status=SimpleNamespace(ended=True)),
+            "r1": SimpleNamespace(status=SimpleNamespace(ended=False)),
+        }
+
+        def should_stop():
+            return should_broadcast_stop(
+                n_policy=len(manager),
+                had_policy_replicas=True,
+                stop_broadcast_sent=False,
+                validation_enabled=False,
+                terminal_complete=manager.terminal_complete,
+                training_finished=manager.training_finished(),
+                all_rollouts_ended=rollout_manager.all_rollouts_ended(),
+            )
+
+        manager.train_ack("p0", 2, 2, False, {}, rollout_manager)
+        self.assertFalse(manager.terminal_complete)
+        self.assertFalse(should_stop())
+
+        manager.train_ack("p1", 2, 2, False, {}, rollout_manager)
+        self.assertTrue(manager.terminal_complete)
+        self.assertEqual(manager.last_real_datafetch_acked_step, 2)
+        self.assertEqual(manager.last_real_datafetch_acked_total_steps, 2)
+        self.assertEqual(manager.samples_on_the_fly, 0)
+        self.assertEqual(len(manager), 2)
+        self.assertFalse(should_stop())
+
+        rollout_manager.rollout_replicas["r1"].status.ended = True
+        self.assertTrue(rollout_manager.all_rollouts_ended())
+        self.assertTrue(should_stop())
+
     def test_real_final_ack_closes_admission_and_cleans_surplus(self):
         manager = PolicyStatusManager()
         manager.config = SimpleNamespace(
