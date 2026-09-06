@@ -111,6 +111,7 @@ def should_broadcast_stop(
     had_policy_replicas: bool,
     stop_broadcast_sent: bool,
     validation_enabled: bool,
+    terminal_complete: bool,
     training_finished: bool,
     all_rollouts_ended: bool,
 ) -> bool:
@@ -119,22 +120,22 @@ def should_broadcast_stop(
 
     STOP is the NCCL-free, authoritative end-of-job signal for the rollouts
     (see :class:`~cosmos_rl.dispatcher.command.StopCommand`).  It must fire
-    exactly once, at the moment the policy side is genuinely done:
+    exactly once, at either of two safe end-of-job points:
 
-    - ``n_policy == 0`` **and** ``had_policy_replicas``: every policy replica
-      has unregistered after finishing its main loop (or been reaped).  A
-      bare ``n_policy == 0`` at cold start -- before any policy has been
-      seen -- must not trigger it.
-    - ``training_finished`` **or** ``all_rollouts_ended``: distinguishes
-      genuine end-of-job from a transient ``n_policy == 0`` during dynamic
-      policy rescaling (scale-to-zero / rolling restart,
-      ``current_step < total_steps``), where stopping the rollouts would be
-      wrong.  ``all_rollouts_ended`` covers the post-``is_end`` case where
-      the buffer-only recompute still leaves ``total_steps > current_step``
-      (untrained buffer backlog the policy will never drain) so
-      ``training_finished()`` is false even though the policy has already
-      unregistered -- without this OR-guard STOP never fires and rollouts
-      wedge (the GRPO end-of-data failure in CI).
+    - Preferred terminal barrier: ``terminal_complete`` **and**
+      ``all_rollouts_ended``.  ``terminal_complete`` proves that every
+      recipient ACKed the final real or synthetic training command, so the
+      still-registered policy replicas can no longer initiate training or a
+      weight-sync collective.  STOP is therefore safe before their HTTP
+      unregister completes, and breaks the lifecycle cycle where policy
+      shutdown waits for rollout shutdown while rollout shutdown waits for
+      policy unregister.
+    - Fallback: ``n_policy == 0`` **and** ``had_policy_replicas`` and either
+      ``training_finished`` or ``all_rollouts_ended``.  This preserves the
+      crash/reap and legacy completion path.  A bare ``n_policy == 0`` at cold
+      start -- before any policy has been seen -- must not trigger it.  The
+      terminal evidence also distinguishes genuine end-of-job from a
+      transient scale-to-zero / rolling restart.
     - ``not validation_enabled``: validation runs keep the final weight sync
       and stop via the R2R ``replica_should_stop`` broadcast instead, so STOP
       would race that path.
@@ -143,13 +144,16 @@ def should_broadcast_stop(
     The caller still decides separately whether any rollout replicas remain
     to receive it; this is purely the "are we at the stop point?" gate.
     """
-    policy_side_done = training_finished or all_rollouts_ended
-    return (
+    terminal_barrier_complete = terminal_complete and all_rollouts_ended
+    unregistered_fallback = (
         n_policy == 0
         and had_policy_replicas
-        and not stop_broadcast_sent
+        and (training_finished or all_rollouts_ended)
+    )
+    return (
+        not stop_broadcast_sent
         and not validation_enabled
-        and policy_side_done
+        and (terminal_barrier_complete or unregistered_fallback)
     )
 
 
@@ -946,6 +950,14 @@ class PolicyStatusManager:
             if self.config.mode == "colocated":
                 # In colocated mode, we initially trigger data fetch for step 1 since the rollouts are generated locally.
                 self.current_step += 1
+                # Keep the first colocated command symmetric with the generic
+                # dispatch path below.  Its eventual train_ack settles the
+                # exact number of rollouts recorded under this step; without
+                # this entry resumed jobs warn about a missing dispatch and
+                # leave samples_on_the_fly accounting stale.
+                self.dispatched_rollouts_by_step[self.current_step] = (
+                    self.config.train.train_batch_per_replica * len(valid_replicas)
+                )
                 if self.config.validation.enable and (
                     self.current_step % self.config.validation.freq == 0
                     or self.current_step == self.total_steps

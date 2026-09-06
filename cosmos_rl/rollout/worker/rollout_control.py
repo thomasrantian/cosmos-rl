@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import os
+import inspect
 import time
 import threading
 import uuid
 import torch
 import atexit
+from enum import Enum
 
 import torch.distributed as dist
 
@@ -97,6 +99,57 @@ Keep in mind that torch distributed is not thread safe. So try to keep the usage
 # in-flight NCCL op (e.g. the WeightSyncThread R2R broadcast) wedges the device;
 # on timeout we abort all NCCL communicators so teardown always completes.
 _TEARDOWN_DRAIN_TIMEOUT_S = float(os.getenv("COSMOS_TEARDOWN_DRAIN_TIMEOUT_S", "15.0"))
+_ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S = float(
+    os.getenv("COSMOS_ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S", "300.0")
+)
+
+# Downstream rollout backends use this capability marker to fail fast when a
+# runtime does not provide atomic async behavior-version accounting.
+DISAGGREGATED_ASYNC_BEHAVIOR_VERSION_CONTRACT_VERSION = 1
+
+
+class PromptVersionDecision(str, Enum):
+    """Admission decision for a controller-requested behavior version."""
+
+    SERVE = "serve"
+    WAIT = "wait"
+    DROP = "drop"
+
+
+def prompt_version_decision(
+    requested: int,
+    live: int,
+    allowed_outdated_steps: int,
+    on_policy: bool,
+) -> PromptVersionDecision:
+    """Decide whether a prompt may run on the worker's current live weights.
+
+    In strict on-policy mode, a stale request can never become current again,
+    so it must be dropped rather than left at the head of the queue forever.
+    A future request waits for the matching weight update. Bounded async mode
+    retains Cosmos's forecast ceiling; generation later stamps the actual live
+    behavior version on the payload.
+    """
+    if on_policy:
+        if requested == live:
+            return PromptVersionDecision.SERVE
+        if requested < live:
+            return PromptVersionDecision.DROP
+        return PromptVersionDecision.WAIT
+    if requested <= live + allowed_outdated_steps:
+        return PromptVersionDecision.SERVE
+    return PromptVersionDecision.WAIT
+
+
+def _batch_requested_weight_version(payloads: List[RLPayload]) -> int:
+    """Return a batch's unique requested version, failing on mixed batches."""
+    versions = {int(payload.weight_version) for payload in payloads}
+    if len(versions) != 1:
+        raise RuntimeError(
+            "A rollout batch must contain one requested weight version; "
+            f"got {sorted(versions)}"
+        )
+    return versions.pop()
 
 
 _LEGACY_PREFETCH_HOOK_WARNED = False
@@ -174,6 +227,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         self._prompt_fetch_lock = threading.Lock()
         self.prefetch_thread: Optional[threading.Thread] = None
         self.current_weight_version = 0
+        self._async_weight_sync_open = False
         self._rollout_end_acknowledged = False
 
         # determine the quantization type
@@ -369,7 +423,72 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 data_packer=self.data_packer,
                 max_concurrent_requests=self.config.rollout.async_config.max_concurrent_requests,
                 stream=self.inference_stream,
+                rollout_generation_fn=self._call_rollout_generation,
             )
+
+    def _quiesce_async_scheduler_for_weight_sync(
+        self, weight_step: Optional[int]
+    ) -> None:
+        """Fence async generation for the duration of a P2R/R2R transaction.
+
+        Backends whose generations run on immutable model leases
+        (``isolates_generation_from_weight_sync``) only need new admission
+        stopped: in-flight episodes keep executing their own snapshot while the
+        live model is rewritten, and the backend holds new leases between
+        ``begin_weight_sync`` and ``end_weight_sync``. Every other backend is
+        drained so no generation observes a partially written model.
+        """
+        if not self._is_async_rollout:
+            return
+        if self.scheduler is None:
+            raise RuntimeError("Async rollout scheduler is not initialized")
+
+        pending_step = getattr(self, "_pending_async_weight_step", None)
+        if (
+            pending_step is not None
+            and weight_step is not None
+            and pending_step != weight_step
+        ):
+            raise RuntimeError(
+                "Mismatched async weight transaction: "
+                f"pending P2R step={pending_step}, R2R step={weight_step}"
+            )
+
+        if getattr(self.rollout, "isolates_generation_from_weight_sync", False):
+            if get_async_r2r_sync_mode(self) != AsyncR2RSyncMode.DISABLED:
+                # Buffered R2R modes publish the version from the WeightSyncThread
+                # after this handler has already resumed, so the lease hold could
+                # not bracket the actual model update.
+                raise RuntimeError(
+                    "Lease-isolated weight sync requires rollout.async_r2r_sync="
+                    "disabled"
+                )
+            # P2R and the following R2R both fence the same transaction; the
+            # lease hold is opened once and released by the resume.
+            if not getattr(self, "_async_weight_sync_open", False):
+                self.scheduler.pause()
+                self.rollout.begin_weight_sync()
+                self._async_weight_sync_open = True
+        else:
+            self.scheduler.quiesce_after_drain(
+                timeout=_ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S
+            )
+        if pending_step is None and weight_step is not None:
+            self._pending_async_weight_step = weight_step
+
+    def _resume_async_scheduler_after_weight_sync(self) -> None:
+        """Commit an async weight transaction and reopen rollout admission."""
+        if not self._is_async_rollout:
+            return
+        if self.scheduler is None:
+            raise RuntimeError("Async rollout scheduler is not initialized")
+        self._pending_async_weight_step = None
+        if getattr(self, "_async_weight_sync_open", False):
+            # ``current_weight_version`` is already published, so leases opened
+            # from here on carry the version of the weights they snapshot.
+            self.rollout.end_weight_sync(int(self.current_weight_version))
+            self._async_weight_sync_open = False
+        self.scheduler.resume()
 
     def prepare_shard_infos_for_weight_sync_insts(self):
         # update the underlying model before prepare shard infos for weight sync instructions.
@@ -526,14 +645,16 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
     def handle_stop(self, command: StopCommand):
         """Controller-authoritative end-of-job stop (non-validation runs).
 
-        The controller publishes STOP once every policy replica has
-        unregistered (its main loop finished, so no policy will read this
-        rollout's output again).  Setting the shutdown signals here breaks
-        ``main_loop`` out of *any* branch -- normal drain, an empty queue,
-        or the weight-version-gate spin that no longer clears once weight
-        syncs have stopped (the residual hang the prompt-stream ``is_end``
-        could not reach).  No NCCL collective is involved, and teardown's
-        bounded ``cleanup_ucxx`` still lets any in-flight output read drain.
+        The controller normally publishes STOP after every policy recipient
+        has ACKed its terminal command and all rollouts have posted ``is_end``;
+        all policy replicas unregistering remains the crash/reap and legacy
+        fallback.  At either point no policy can start another training or
+        weight-sync round.  Setting the shutdown signals here breaks
+        ``main_loop`` out of *any* branch -- normal drain, an empty queue, or
+        the weight-version-gate spin that no longer clears once weight syncs
+        have stopped (the residual hang the prompt-stream ``is_end`` could not
+        reach).  No NCCL collective is involved, and teardown's bounded
+        ``cleanup_ucxx`` still lets any in-flight output read drain.
         """
         wst = getattr(self, "_weight_sync_thread", None)
         if wst is not None:
@@ -1231,6 +1352,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if command.dst_replica_name != self.replica_name:
             return
 
+        self._quiesce_async_scheduler_for_weight_sync(command.weight_step)
+
         async_mode = get_async_r2r_sync_mode(self)
         if async_mode != AsyncR2RSyncMode.DISABLED:
             wst = self._weight_sync_thread
@@ -1408,7 +1531,10 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     f"Count of trainable unsplitted params which have been synced in P2R {transferred_groups_cnt} must match the synced_trainable_params attribute {self.p2r_synced_trainable_params_cnt}."
                 )
 
-            self.state.set_weight_synced()
+            # Async generation stays quiesced until the matching R2R command
+            # fences all CUDA work and atomically publishes the new version.
+            if not self._is_async_rollout:
+                self.state.set_weight_synced()
         if not command.trainable_only:
             self.non_trainable_params_received = True
 
@@ -1443,6 +1569,11 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if self.replica_name != src_replica_name:
             # for replicas that needs to be broadcasted, use dummy format.
             self.lazy_initialize_rollout_engine(load_format="dummy")
+
+        # Every replica must finish work admitted under the old model before
+        # any live parameter is mutated. The leader may already be quiesced
+        # from P2R; followers enter the same fence here.
+        self._quiesce_async_scheduler_for_weight_sync(broadcast_command.weight_step)
 
         was_synced = self.state.weight_synced()
         trainable_only = broadcast_command.trainable_only
@@ -1486,8 +1617,6 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     bytes_broadcast / (1024 * 1024),
                     elapsed,
                 )
-                if not self.state.weight_synced():
-                    self.state.set_weight_synced()
                 if not trainable_only:
                     self.non_trainable_params_received = True
             else:
@@ -1530,12 +1659,6 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                             if not parameter.is_contiguous():
                                 parameter.copy_(recv_tensor)
 
-                    if not self.state.weight_synced():
-                        assert not trainable_only, (
-                            "[Rollout] Trainable only must be set to False for the first broadcast."
-                        )
-                        self.state.set_weight_synced()
-
                 logger.info(
                     f"[Rollout] Finished broadcasting of parameters to all replicas. While {skipped_params_cnt} unsplitted non-trainable params skipped and {transferred_params_cnt} unsplitted params transferred."
                 )
@@ -1557,9 +1680,17 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                             f"Synced params count in R2R {self.r2r_synced_trainable_params_cnt} must match the sum of count of attribute {self.p2r_synced_trainable_params_cnt} and {len(self.misc_params)}."
                         )
 
+        # A CUDA enqueue is not a completed model update. This common fence
+        # covers grouped, legacy per-parameter, and single-replica P2R-only
+        # paths before either readiness flag or version becomes observable.
+        if async_mode == AsyncR2RSyncMode.DISABLED:
+            self.inference_stream.synchronize()
+
         # --- Post-broadcast bookkeeping (weight version, validation, shutdown) ---
 
         current_step = broadcast_command.weight_step
+        stop_after_validation = False
+        run_validation_before_stop = False
 
         # When async mode is enabled, the NCCL broadcast hasn't happened yet
         # (it's queued on the WST).  The WST's _execute_r2r will update
@@ -1600,10 +1731,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 }
                 self.redis_controller.publish_teacher_request(data, self.replica_name)
                 logger.info("[Rollout] Published end event to reference")
-                if self.validation_flag.is_set():
-                    self.do_validation()
-                self.shutdown_signal.set()
-                self.shutdown_mp_signal.set()
+                run_validation_before_stop = self.validation_flag.is_set()
+                stop_after_validation = True
 
         # In async mode the WST's _execute_r2r calls set_weight_synced
         # after the broadcast actually completes.  Calling it here would
@@ -1615,6 +1744,18 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 current_step,
             )
             self.state.set_weight_synced()
+
+        # Publishing the version and readiness above commits the transaction.
+        # Only now may new generations acquire a lease of the updated model.
+        self._resume_async_scheduler_after_weight_sync()
+
+        # Async validation itself uses the scheduler, so it must run after the
+        # weight transaction has reopened task admission.
+        if run_validation_before_stop:
+            self.do_validation()
+        if stop_after_validation:
+            self.shutdown_signal.set()
+            self.shutdown_mp_signal.set()
 
     def query_command_from_controller(self):
         """Background task to check commands from the controller.
@@ -1988,7 +2129,25 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 self._inference_sync_installed = True
             sync_buffer_to_live(self)
 
-        kwargs["current_weight_version"] = self.current_weight_version
+        actual_version = int(self.current_weight_version)
+        payloads = kwargs.get("payloads") or []
+        for payload in payloads:
+            # The controller's value is an admission forecast. At generation
+            # start it becomes the immutable version of the weights that are
+            # actually leased and executed.
+            payload.weight_version = actual_version
+        # AlpaGym consumes the version as an explicit backend argument, while
+        # built-in async backends such as VLLMRolloutAsync intentionally keep
+        # a narrower signature. Preserve those signatures and pass the extra
+        # contract value only when the backend declares it (or **kwargs).
+        generation_parameters = inspect.signature(
+            self.rollout.rollout_generation
+        ).parameters
+        if "current_weight_version" in generation_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in generation_parameters.values()
+        ):
+            kwargs["current_weight_version"] = actual_version
         return self.rollout.rollout_generation(**kwargs)
 
     @torch.no_grad()
@@ -2167,6 +2326,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
             if not self.state.weight_synced():
                 self._mainloop_branch_counts["weight_unsynced"] += 1
+                if self._is_async_rollout:
+                    self.shutdown_signal.wait(timeout=0.001)
                 continue
 
             _, is_validation, _, _ = self.report_rollouts()
@@ -2176,6 +2337,10 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
             if self._is_async_rollout:
                 self.stream_generation_step()
+                # The async backend progresses in its scheduler thread. When
+                # no command/result is ready this loop must yield the GIL or it
+                # can starve simulator and inference worker threads.
+                self.shutdown_signal.wait(timeout=0.001)
                 continue
 
             # In single-producer mode the prefetch thread owns
@@ -2265,14 +2430,32 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             else:
                 logger.debug(f"[Rollout] generate start for rank {self.global_rank}")
 
-                first_payload: RLPayload = self._prompt_queue.queue[0][0]
+                queued_payloads: List[RLPayload] = self._prompt_queue.queue[0]
+                requested_version = _batch_requested_weight_version(queued_payloads)
                 allowed = self.config.train.train_policy.allowed_outdated_steps
-                ceiling = self.current_weight_version + allowed
-                is_valid_prompt_for_current_weight_version = (
-                    first_payload.weight_version <= ceiling
+                version_decision = prompt_version_decision(
+                    requested_version,
+                    self.current_weight_version,
+                    allowed,
+                    self.config.train.train_policy.on_policy,
                 )
 
-                if not is_valid_prompt_for_current_weight_version:
+                if version_decision == PromptVersionDecision.DROP:
+                    stale_payloads = self._prompt_queue.get()
+                    self._report_discarded_samples(
+                        len(stale_payloads) * self.config.rollout.n_generation
+                    )
+                    logger.info(
+                        "[Rollout rank=%d] dropped stale strict-on-policy batch: "
+                        "requested=%s live=%s count=%d",
+                        self.global_rank,
+                        requested_version,
+                        self.current_weight_version,
+                        len(stale_payloads),
+                    )
+                    continue
+
+                if version_decision == PromptVersionDecision.WAIT:
                     self._mainloop_branch_counts["version_fail"] += 1
                     # Explain prompt-version rejections at most once per 5s
                     # per worker.
@@ -2283,14 +2466,13 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                         self._version_fail_last_log_ts = now
                         logger.info(
                             "[Rollout rank=%d] prompt rejected: "
-                            "prompt.weight_version=%s current_weight_version=%s "
-                            "allowed_outdated=%d ceiling=%s; head-of-queue "
+                            "requested_weight_version=%s current_weight_version=%s "
+                            "allowed_outdated=%d; head-of-queue "
                             "will be re-checked until current_weight_version advances",
                             self.global_rank,
-                            first_payload.weight_version,
+                            requested_version,
                             self.current_weight_version,
                             allowed,
-                            ceiling,
                         )
                     # Back off before re-checking the head-of-queue
                     # prompt.  The rejection clears as soon as the next
@@ -2416,7 +2598,6 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 old_payload.completion_token_ids = result.completion_token_ids
                 old_payload.prompt_logprobs = result.prompt_logprobs
                 old_payload.prompt_token_ids = result.prompt_token_ids
-                old_payload.weight_version = self.current_weight_version
                 old_payload.cumulative_logprob = result.cumulative_logprob
                 old_payload.extra_info = result.extra_info
                 if self.config.rollout.multi_turn_config.enable:
@@ -2429,12 +2610,18 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     )
                 valid_payloads.append(old_payload)
             valid_payloads = self.enqueue_teacher_calculation(valid_payloads)
-            self.reward_dispatcher.enqueue_rewards_cal(
-                valid_payloads,
-                False,
-                self.current_weight_version,
-                bypass_reward=self.config.train.train_policy.bypass_reward,
-            )
+            payloads_by_version: dict[int, List[RLPayload]] = {}
+            for payload in valid_payloads:
+                payloads_by_version.setdefault(int(payload.weight_version), []).append(
+                    payload
+                )
+            for behavior_version, version_payloads in payloads_by_version.items():
+                self.reward_dispatcher.enqueue_rewards_cal(
+                    version_payloads,
+                    False,
+                    behavior_version,
+                    bypass_reward=self.config.train.train_policy.bypass_reward,
+                )
         return valid_payloads_list, valid_result
 
     def one_step_generation(
@@ -2548,14 +2735,30 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         is_validation = validation_step is not None
 
         # Check if the prompt is valid for the current weight version
-        if not is_validation and not self._prompt_queue.empty():
-            first_payload: RLPayload = self._prompt_queue.queue[0][0]
-            is_valid_prompt_for_current_weight_version = (
-                first_payload.weight_version
-                <= self.current_weight_version
-                + self.config.train.train_policy.allowed_outdated_steps
+        if not is_validation and not prompt_queue.empty():
+            queued_payloads: List[RLPayload] = prompt_queue.queue[0]
+            requested_version = _batch_requested_weight_version(queued_payloads)
+            version_decision = prompt_version_decision(
+                requested_version,
+                self.current_weight_version,
+                self.config.train.train_policy.allowed_outdated_steps,
+                self.config.train.train_policy.on_policy,
             )
-            if not is_valid_prompt_for_current_weight_version:
+            if version_decision == PromptVersionDecision.DROP:
+                stale_payloads = prompt_queue.get_nowait()
+                self._report_discarded_samples(
+                    len(stale_payloads) * self.config.rollout.n_generation
+                )
+                logger.info(
+                    "[Rollout rank=%d] dropped stale strict-on-policy async batch: "
+                    "requested=%s live=%s count=%d",
+                    self.global_rank,
+                    requested_version,
+                    self.current_weight_version,
+                    len(stale_payloads),
+                )
+                return 0, is_end
+            if version_decision == PromptVersionDecision.WAIT:
                 return 0, False
 
         # try to get the prompts from the prompt queue, even if the prompt queue is empty.
@@ -2591,6 +2794,12 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         payloads_list: List[RLPayload] = []
         rollout_results: List[RolloutResult] = []
         for cr in results:
+            if int(cr.payload.weight_version) != cr.behavior_weight_version:
+                raise RuntimeError(
+                    "Completed rollout behavior version was mutated after generation: "
+                    f"start={cr.behavior_weight_version}, "
+                    f"reported={cr.payload.weight_version}"
+                )
             payloads_list.append(cr.payload)
             rollout_results.append(cr.result)
 
@@ -2605,6 +2814,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
         This function is non-blocking.
         """
+        self.scheduler.raise_if_failed()
+
         # update the state of the rollout generation worker
         if (
             self.state.prompt_fetch_end()

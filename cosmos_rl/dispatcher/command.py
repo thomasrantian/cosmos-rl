@@ -402,14 +402,16 @@ class StopCommand(Command):
     non-validation step), STOP triggers no collective, so it cannot orphan
     an in-flight P2R/R2R recv or wedge ``ncclCommAbort``.
 
-    The controller publishes STOP only after every policy replica has
-    unregistered (``should_broadcast_stop``), so the trainer is no longer
-    driving new P2R/R2R rounds when rollouts observe it.  Any weight-sync
-    collective already in flight on a rollout finishes on the ranks that
-    entered it; ranks that never joined (e.g. wedged on the weight-version
-    gate) are unblocked by STOP without touching NCCL.  Cross-replica
-    ordering is therefore safe: STOP is not a mid-collective abort on some
-    nodes while others still block in the same NCCL group.
+    The controller publishes STOP only after the terminal policy command has
+    been ACKed by every recipient and all rollouts have posted ``is_end`` (or,
+    as a fallback, after every policy replica has unregistered; see
+    ``should_broadcast_stop``).  At either point the trainer is no longer
+    driving new P2R/R2R rounds.  Any weight-sync collective already in flight
+    on a rollout finishes on the ranks that entered it; ranks that never
+    joined (e.g. wedged on the weight-version gate) are unblocked by STOP
+    without touching NCCL.  Cross-replica ordering is therefore safe: STOP is
+    not a mid-collective abort on some nodes while others still block in the
+    same NCCL group.
 
     ``consume_one_command`` broadcasts the dequeued command across ranks via
     ``broadcast_object_cpu``, so all ranks of a multi-rank worker receive
@@ -545,10 +547,11 @@ class TrainingCompleteCommand(Command):
     ``step_training``, sends ``train_ack``, and exits its main loop when
     ``global_step >= total_steps``.
 
-    Rollout shutdown is separate: once every policy replica has unregistered,
-    the controller broadcasts :class:`StopCommand` to the rollout set (see
-    ``should_broadcast_stop``).  ``TrainingCompleteCommand`` ends training;
-    ``StopCommand`` ends rollouts.
+    Rollout shutdown is separate: once every recipient ACKs this terminal
+    command and all rollouts have posted ``is_end``, the controller broadcasts
+    :class:`StopCommand` to the rollout set (with all-policy-unregistered kept
+    as a fallback; see ``should_broadcast_stop``).
+    ``TrainingCompleteCommand`` ends training; ``StopCommand`` ends rollouts.
     """
 
     def __init__(

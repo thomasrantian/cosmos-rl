@@ -23,7 +23,7 @@ import threading
 import shutil
 import glob
 from typing import Optional, Dict
-from transformers import AutoConfig, GenerationConfig
+from transformers import GenerationConfig
 
 from safetensors.torch import save_file
 from huggingface_hub import create_repo, upload_folder, whoami
@@ -39,6 +39,7 @@ import cosmos_rl.utils.util as util
 from cosmos_rl.utils.fp8.fp8_util import FP8ModelConverter
 from cosmos_rl.policy.kernel.modeling_utils import init_flash_attn_meta
 from cosmos_rl.utils.activation_offloading import get_act_offloading_ctx_manager
+from cosmos_rl.utils.model_config import load_model_config
 from cosmos_rl.policy.trainer.base import Trainer
 from cosmos_rl.policy.trainer.base import extract_from_cuda_tensor, wrap_to_cuda_tensor
 from cosmos_rl.utils.checkpoint import CheckpointMananger
@@ -82,7 +83,7 @@ class LLMTrainer(Trainer):
             config.train.deterministic, config.train.compile, config.train.fa_version
         )
 
-        self.hf_config = util.retry(AutoConfig.from_pretrained)(
+        self.hf_config = util.retry(load_model_config)(
             config.policy.model_name_or_path,
             trust_remote_code=True,
         )
