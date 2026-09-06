@@ -227,6 +227,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         self._prompt_fetch_lock = threading.Lock()
         self.prefetch_thread: Optional[threading.Thread] = None
         self.current_weight_version = 0
+        self._async_weight_sync_open = False
         self._rollout_end_acknowledged = False
 
         # determine the quantization type
@@ -428,7 +429,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
     def _quiesce_async_scheduler_for_weight_sync(
         self, weight_step: Optional[int]
     ) -> None:
-        """Drain async generation and hold it across a P2R/R2R transaction."""
+        """Fence async generation for the duration of a P2R/R2R transaction.
+
+        Backends whose generations run on immutable model leases
+        (``isolates_generation_from_weight_sync``) only need new admission
+        stopped: in-flight episodes keep executing their own snapshot while the
+        live model is rewritten, and the backend holds new leases between
+        ``begin_weight_sync`` and ``end_weight_sync``. Every other backend is
+        drained so no generation observes a partially written model.
+        """
         if not self._is_async_rollout:
             return
         if self.scheduler is None:
@@ -445,7 +454,25 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 f"pending P2R step={pending_step}, R2R step={weight_step}"
             )
 
-        self.scheduler.quiesce_after_drain(timeout=_ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S)
+        if getattr(self.rollout, "isolates_generation_from_weight_sync", False):
+            if get_async_r2r_sync_mode(self) != AsyncR2RSyncMode.DISABLED:
+                # Buffered R2R modes publish the version from the WeightSyncThread
+                # after this handler has already resumed, so the lease hold could
+                # not bracket the actual model update.
+                raise RuntimeError(
+                    "Lease-isolated weight sync requires rollout.async_r2r_sync="
+                    "disabled"
+                )
+            # P2R and the following R2R both fence the same transaction; the
+            # lease hold is opened once and released by the resume.
+            if not getattr(self, "_async_weight_sync_open", False):
+                self.scheduler.pause()
+                self.rollout.begin_weight_sync()
+                self._async_weight_sync_open = True
+        else:
+            self.scheduler.quiesce_after_drain(
+                timeout=_ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S
+            )
         if pending_step is None and weight_step is not None:
             self._pending_async_weight_step = weight_step
 
@@ -456,6 +483,11 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if self.scheduler is None:
             raise RuntimeError("Async rollout scheduler is not initialized")
         self._pending_async_weight_step = None
+        if getattr(self, "_async_weight_sync_open", False):
+            # ``current_weight_version`` is already published, so leases opened
+            # from here on carry the version of the weights they snapshot.
+            self.rollout.end_weight_sync(int(self.current_weight_version))
+            self._async_weight_sync_open = False
         self.scheduler.resume()
 
     def prepare_shard_infos_for_weight_sync_insts(self):

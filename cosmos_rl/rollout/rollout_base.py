@@ -135,6 +135,31 @@ class RolloutBase(ABC):
         # In some case, the engine may create a child thread to run the generation, Rollout should release the resources before shutting down.
         pass
 
+    # Backends that bind every generation to an immutable snapshot of the model
+    # (a "lease") may set this True. Async weight sync then only stops admitting
+    # new generations instead of draining the in-flight ones, and brackets the
+    # live-model update with ``begin_weight_sync`` / ``end_weight_sync`` so the
+    # backend can hold new leases until the new version is in place.
+    isolates_generation_from_weight_sync: bool = False
+
+    def begin_weight_sync(self):
+        """
+        Called before the live model is mutated by an async weight sync when
+        ``isolates_generation_from_weight_sync`` is True. The backend must not
+        hand out new model leases until ``end_weight_sync`` is called.
+        """
+        pass
+
+    def end_weight_sync(self, weight_version: int):
+        """
+        Called after the live model holds ``weight_version`` when
+        ``isolates_generation_from_weight_sync`` is True. New leases opened
+        from now on snapshot the updated model.
+        Args:
+            weight_version: The weight version the live model now holds.
+        """
+        pass
+
     def pre_get_params_for_sync_hook(
         self,
         quantization_type: str,
