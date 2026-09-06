@@ -17,6 +17,7 @@ from cosmos_rl.rollout.worker.asynchronous.rollout_task_scheduler import (
     RolloutTaskScheduler,
 )
 from cosmos_rl.rollout.worker.rollout_control import (
+    _ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S,
     DisaggregatedRolloutControlWorker,
     PromptVersionDecision,
     _batch_requested_weight_version,
@@ -559,3 +560,123 @@ def test_weight_publish_fences_cuda_before_version_and_resume() -> None:
         ("ready", 9),
         ("resume", 9),
     ]
+
+
+class _LeasedRolloutEngine(_FakeRolloutEngine):
+    isolates_generation_from_weight_sync = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sync_events: list[tuple[str, int | None]] = []
+
+    def begin_weight_sync(self) -> None:
+        self.sync_events.append(("begin", None))
+
+    def end_weight_sync(self, weight_version: int) -> None:
+        self.sync_events.append(("end", weight_version))
+
+
+def test_lease_isolated_backend_fences_admission_without_draining() -> None:
+    engine = _LeasedRolloutEngine()
+    live_version = [8]
+    starts: list[tuple[int, int]] = []
+    release = threading.Semaphore(0)
+
+    def generation_fn(**kwargs):
+        payload = kwargs["payloads"][0]
+        payload.weight_version = live_version[0]
+        starts.append((payload.prompt_idx, payload.weight_version))
+
+        async def generate():
+            await asyncio.to_thread(release.acquire)
+            return [RolloutResult(completions=["ok"])]
+
+        return generate()
+
+    scheduler = RolloutTaskScheduler(
+        rollout_engine=engine,
+        data_packer=object(),
+        max_concurrent_requests=1,
+        check_interval=0.005,
+        rollout_generation_fn=generation_fn,
+    )
+    scheduler.start(lambda value: setattr(value, "initialized", True), True)
+    scheduler.put_rollout_batch(
+        [
+            RolloutTask(idx=0, payload=RLPayload(prompt_idx=0, weight_version=99)),
+            RolloutTask(idx=1, payload=RLPayload(prompt_idx=1, weight_version=99)),
+        ]
+    )
+    _wait_until(lambda: starts == [(0, 8)])
+
+    worker = SimpleNamespace(
+        _is_async_rollout=True,
+        scheduler=scheduler,
+        rollout=engine,
+        current_weight_version=8,
+        config=SimpleNamespace(rollout=SimpleNamespace(async_r2r_sync="disabled")),
+    )
+
+    # The P2R fence returns while prompt 0 is still generating.
+    DisaggregatedRolloutControlWorker._quiesce_async_scheduler_for_weight_sync(
+        worker, 9
+    )
+    assert scheduler.is_paused()
+    assert engine.sync_events == [("begin", None)]
+    # The R2R fence of the same transaction does not reopen the lease hold.
+    DisaggregatedRolloutControlWorker._quiesce_async_scheduler_for_weight_sync(
+        worker, 9
+    )
+    assert engine.sync_events == [("begin", None)]
+
+    # Prompt 0 completes under the fence; prompt 1 must still wait for it.
+    release.release()
+    _wait_until(lambda: scheduler.complete_queue.qsize() == 1)
+    time.sleep(0.05)
+    assert starts == [(0, 8)]
+
+    worker.current_weight_version = 9
+    live_version[0] = 9
+    DisaggregatedRolloutControlWorker._resume_async_scheduler_after_weight_sync(worker)
+    assert engine.sync_events == [("begin", None), ("end", 9)]
+    assert not scheduler.is_paused()
+    _wait_until(lambda: starts == [(0, 8), (1, 9)])
+    release.release()
+    _wait_until(lambda: scheduler.complete_queue.qsize() == 2)
+    assert [item.behavior_weight_version for item in scheduler.get_all()] == [8, 9]
+    scheduler.stop()
+
+
+def test_draining_backend_keeps_the_drain_fence() -> None:
+    calls: list[tuple] = []
+    worker = SimpleNamespace(
+        _is_async_rollout=True,
+        rollout=_FakeRolloutEngine(),
+        scheduler=SimpleNamespace(
+            quiesce_after_drain=lambda timeout: calls.append(("drain", timeout)),
+            pause=lambda: calls.append(("pause",)),
+            resume=lambda: calls.append(("resume",)),
+        ),
+        current_weight_version=8,
+    )
+
+    DisaggregatedRolloutControlWorker._quiesce_async_scheduler_for_weight_sync(
+        worker, 9
+    )
+    DisaggregatedRolloutControlWorker._resume_async_scheduler_after_weight_sync(worker)
+
+    assert calls == [("drain", _ASYNC_WEIGHT_SYNC_DRAIN_TIMEOUT_S), ("resume",)]
+
+
+def test_lease_isolated_backend_rejects_buffered_r2r_modes() -> None:
+    worker = SimpleNamespace(
+        _is_async_rollout=True,
+        scheduler=SimpleNamespace(),
+        rollout=_LeasedRolloutEngine(),
+        config=SimpleNamespace(rollout=SimpleNamespace(async_r2r_sync="inference")),
+    )
+
+    with pytest.raises(RuntimeError, match="async_r2r_sync=disabled"):
+        DisaggregatedRolloutControlWorker._quiesce_async_scheduler_for_weight_sync(
+            worker, 9
+        )
